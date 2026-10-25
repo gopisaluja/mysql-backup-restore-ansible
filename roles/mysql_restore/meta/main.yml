@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  author: Gobinda Saluja
+  description: Guarded restore of S3-stored MySQL dumps into non-production databases, with checksum verification, PII masking and smoke checks.
+  license: MIT
+  min_ansible_version: "2.18"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: Debian
+      versions:
+        - bookworm
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - mysql
+    - restore
+    - s3
+    - database
+dependencies: []

@@ -1,0 +1,141 @@
+// Self-service restore of a MySQL backup into a NON-production environment.
+//
+// Layers of protection against restoring into production:
+//   1. TARGET_ENV only offers non-prod choices, and is re-validated below.
+//   2. A second person from `db-restore-approvers` must approve (four eyes).
+//   3. playbooks/restore.yml only targets hosts in mysql_restore_targets.
+//   4. The mysql_restore role refuses hosts whose inventory env is protected.
+//
+// Jenkins credentials (IDs are examples):
+//   ansible-ssh-key         SSH Username with private key
+//   ansible-vault-password  Secret file: Ansible Vault password
+//   slack-webhook-db-ops    Secret text: Slack incoming-webhook URL
+pipeline {
+  // No executor is held while the request waits for approval.
+  agent none
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '100'))
+  }
+
+  parameters {
+    choice(name: 'SOURCE_DB', choices: ['app_db', 'billing_db'],
+           description: 'Database whose production backup is restored')
+    string(name: 'BACKUP', defaultValue: 'latest', trim: true,
+           description: "'latest', or a UTC date YYYY-MM-DD (newest backup of that day)")
+    choice(name: 'TARGET_ENV', choices: ['staging', 'qa'],
+           description: 'Environment to restore into (production is intentionally not offered)')
+    string(name: 'TARGET_DB', defaultValue: '', trim: true,
+           description: 'Target database name; blank = same as SOURCE_DB')
+    string(name: 'REASON', defaultValue: '', trim: true,
+           description: 'Ticket or reason; recorded in the build description and notification')
+  }
+
+  environment {
+    INVENTORY = 'inventories/example/hosts.yml'
+  }
+
+  stages {
+    stage('Validate request') {
+      steps {
+        script {
+          if (['prod', 'production'].contains(params.TARGET_ENV)) {
+            error('Refusing to restore into a production environment.')
+          }
+          if (!(params.BACKUP ==~ /latest|\d{4}-\d{2}-\d{2}/)) {
+            error("BACKUP must be 'latest' or YYYY-MM-DD, got '${params.BACKUP}'.")
+          }
+          if (params.TARGET_DB && !(params.TARGET_DB ==~ /[A-Za-z0-9_]+/)) {
+            error('TARGET_DB may only contain letters, digits and underscores.')
+          }
+          if (!params.REASON) {
+            error('REASON is required (ticket id or short justification).')
+          }
+          env.EFFECTIVE_TARGET_DB = params.TARGET_DB ?: params.SOURCE_DB
+          currentBuild.description = "${params.SOURCE_DB}@${params.BACKUP} -> ${params.TARGET_ENV}/${env.EFFECTIVE_TARGET_DB} | ${params.REASON}"
+        }
+      }
+    }
+
+    stage('Approval') {
+      steps {
+        timeout(time: 30, unit: 'MINUTES') {
+          script {
+            def approval = input(
+              message: "Restore ${params.SOURCE_DB} (${params.BACKUP}) into ${params.TARGET_ENV}/${env.EFFECTIVE_TARGET_DB}? " +
+                       'All existing data in that database will be replaced.',
+              ok: 'Approve restore',
+              submitter: 'db-restore-approvers',
+              submitterParameter: 'APPROVER'
+            )
+            def approver = (approval instanceof Map) ? approval['APPROVER'] : approval
+            def requester = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId
+            if (requester && approver == requester) {
+              error('The requester cannot approve their own restore.')
+            }
+            env.APPROVED_BY = approver
+          }
+        }
+      }
+    }
+
+    stage('Restore') {
+      agent { label 'ansible' }
+      steps {
+        sh '''
+          set -eu
+          ansible-galaxy collection install -r collections/requirements.yml
+          rm -rf artifacts && mkdir -p artifacts
+        '''
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'ansible-ssh-key', keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER'),
+          file(credentialsId: 'ansible-vault-password', variable: 'VAULT_PASSWORD_FILE')
+        ]) {
+          // Parameters reach the shell as environment variables (validated
+          // above) instead of being interpolated into the script by Groovy.
+          sh '''
+            set -eu
+            export RESTORE_ARTIFACTS_DIR="$WORKSPACE/artifacts"
+            ansible-playbook playbooks/restore.yml \
+              -i "$INVENTORY" \
+              --private-key "$SSH_KEY_FILE" -u "$SSH_USER" \
+              --vault-password-file "$VAULT_PASSWORD_FILE" \
+              -e "restore_target_env=$TARGET_ENV" \
+              -e "restore_source_db=$SOURCE_DB" \
+              -e "restore_backup_date=$BACKUP" \
+              -e "restore_target_db=$EFFECTIVE_TARGET_DB"
+          '''
+        }
+      }
+      post {
+        always {
+          // restore-<host>-<db>.json: backup key, sha256, duration, data age
+          archiveArtifacts artifacts: 'artifacts/*.json', allowEmptyArchive: true
+        }
+        success {
+          notifySlack(":white_check_mark: Restored ${params.SOURCE_DB}@${params.BACKUP} into ${params.TARGET_ENV}/${env.EFFECTIVE_TARGET_DB} " +
+                      "(approved by ${env.APPROVED_BY}; ${params.REASON}) ${env.BUILD_URL}")
+        }
+        failure {
+          notifySlack(":x: Restore of ${params.SOURCE_DB}@${params.BACKUP} into ${params.TARGET_ENV} FAILED ${env.BUILD_URL}")
+        }
+      }
+    }
+  }
+}
+
+// The message travels through an environment variable and is JSON-encoded by
+// python3, so free-text parameters are never spliced into a shell command.
+def notifySlack(String text) {
+  withCredentials([string(credentialsId: 'slack-webhook-db-ops', variable: 'SLACK_WEBHOOK_URL')]) {
+    withEnv(["SLACK_TEXT=${text}"]) {
+      sh '''
+        payload=$(python3 -c 'import json, os; print(json.dumps({"text": os.environ["SLACK_TEXT"]}))')
+        curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
+          --data "$payload" "$SLACK_WEBHOOK_URL" || echo "Slack notification failed (ignored)"
+      '''
+    }
+  }
+}

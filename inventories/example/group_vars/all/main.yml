@@ -1,0 +1,18 @@
+---
+# Shared, non-secret settings (placeholders).
+backup_s3_bucket: example-mysql-backups
+backup_s3_region: eu-west-1
+backup_s3_prefix: mysql
+# Leave empty to rely on the bucket's default SSE-KMS key (recommended), or set
+# the full key ARN. Do not use an alias here: the bucket policy compares ARNs.
+backup_s3_kms_key_id: ""
+
+# Secrets are NOT kept in this file. Put them in an encrypted sibling file:
+#   ansible-vault create inventories/<env>/group_vars/all/vault.yml
+# defining:
+#   vault_mysql_backup_user / vault_mysql_backup_password
+#   vault_mysql_restore_user / vault_mysql_restore_password
+#
+# The Slack incoming-webhook URL is injected by Jenkins (credentials binding)
+# as an environment variable, so it never lands on disk or in the build log.
+ops_slack_webhook_url: "{{ lookup('ansible.builtin.env', 'SLACK_WEBHOOK_URL') }}"

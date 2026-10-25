@@ -1,0 +1,30 @@
+# Ansible
+collections/ansible_collections/
+.ansible/
+*.retry
+artifacts/
+
+# Secrets: never commit plaintext. Encrypted vault files (ansible-vault) are fine.
+.vault_pass*
+vault-password*
+*.vault.plain
+.env
+
+# Terraform (this is a module, so no lock file or state is committed)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+*.auto.tfvars
+
+# Python
+.venv/
+venv/
+__pycache__/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

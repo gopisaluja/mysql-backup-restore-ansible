@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# Client credentials for the mysql_backup role (mode 0600, owner root).
+# Values are quoted; backslashes and double quotes are escaped.
+[client]
+user="{{ mysql_backup_login_user | replace('\\', '\\\\') | replace('"', '\\"') }}"
+password="{{ mysql_backup_login_password | replace('\\', '\\\\') | replace('"', '\\"') }}"
+host={{ mysql_backup_login_host }}
+port={{ mysql_backup_login_port }}
+{% if mysql_backup_method == 'xtrabackup' %}
+
+[xtrabackup]
+user="{{ mysql_backup_login_user | replace('\\', '\\\\') | replace('"', '\\"') }}"
+password="{{ mysql_backup_login_password | replace('\\', '\\\\') | replace('"', '\\"') }}"
+{% endif %}

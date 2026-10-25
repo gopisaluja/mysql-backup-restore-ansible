@@ -1,0 +1,14 @@
+---
+# Strictest built-in profile: FQCNs, no-changed-when, risky-file-permissions,
+# name casing/templating, var-naming with role prefixes, schema checks, ...
+profile: production
+
+# Collections are installed explicitly from collections/requirements.yml
+# (CI step / Jenkins "Prepare" stage), so the linter never installs on its own.
+offline: true
+
+exclude_paths:
+  - .ansible/
+  - .github/
+  - collections/ansible_collections/
+  - terraform/

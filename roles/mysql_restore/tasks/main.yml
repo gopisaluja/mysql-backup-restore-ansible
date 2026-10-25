@@ -1,0 +1,148 @@
+---
+# Flow: guards -> prepare host -> resolve backup in S3 -> download + verify
+#       checksum -> drop/create target -> import -> mask PII -> smoke checks
+#       -> marker + report.
+#
+# Idempotency notes
+# * Guards, metadata lookups and smoke checks are read-only.
+# * The download uses overwrite=different, so with mysql_restore_cleanup_staging
+#   set to false a re-run reuses the already verified local file.
+# * The import is intentionally NOT a no-op on re-run: each run resets the
+#   target database to exactly the chosen backup (same input, same end state).
+#   Set mysql_restore_skip_if_unchanged: true to skip the import when the
+#   marker shows that backup (by SHA-256) is already restored.
+- name: Enforce restore guards before touching the host
+  ansible.builtin.include_tasks: guard.yml
+
+- name: Record the start time
+  ansible.builtin.set_fact:
+    mysql_restore__t_start: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Install compression tools and venv support
+  ansible.builtin.package:
+    name: "{{ mysql_restore_os_packages }}"
+    state: present
+  when: mysql_restore_install_packages | bool
+
+- name: Install the AWS SDK and PyMySQL into a dedicated virtualenv
+  ansible.builtin.pip:
+    name: "{{ mysql_restore_python_packages }}"
+    virtualenv: "{{ mysql_restore_python_venv }}"
+    virtualenv_command: python3 -m venv
+    extra_args: "{{ mysql_restore_pip_extra_args | default(omit, true) }}"
+  when: mysql_restore_install_packages | bool
+
+- name: Create staging and state directories
+  ansible.builtin.file:
+    path: "{{ mysql_restore__dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ mysql_restore_staging_dir }}"
+    - "{{ mysql_restore_state_dir }}"
+  loop_control:
+    loop_var: mysql_restore__dir
+
+- name: Render the client option file with restore credentials
+  ansible.builtin.template:
+    src: my.cnf.j2
+    dest: "{{ mysql_restore_client_cnf }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: mysql_restore_manage_client_cnf | bool
+
+- name: Resolve, restore, mask and verify
+  vars:
+    ansible_python_interpreter: "{{ mysql_restore_python_venv }}/bin/python"
+  # Credentials go to PyMySQL as (no_log) module arguments: PyMySQL strips the
+  # quotes in option files but does not unescape them. Empty values fall back
+  # to the option file, which covers an externally provisioned one.
+  module_defaults:
+    group/ansible.mysql.all:
+      config_file: "{{ mysql_restore_client_cnf }}"
+      login_user: "{{ mysql_restore_login_user }}"
+      login_password: "{{ mysql_restore_login_password }}"
+      login_host: "{{ mysql_restore_login_host }}"
+      login_port: "{{ mysql_restore_login_port }}"
+  block:
+    - name: Find, download and verify the backup
+      ansible.builtin.include_tasks: fetch.yml
+
+    - name: Import the backup and apply masking
+      ansible.builtin.include_tasks: restore.yml
+      when: mysql_restore__needed | bool
+
+    - name: Run post-restore smoke checks
+      ansible.builtin.include_tasks: smoke.yml
+
+    - name: Record the end time
+      ansible.builtin.set_fact:
+        mysql_restore__t_end: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Build the restore report
+      ansible.builtin.set_fact:
+        mysql_restore__report:
+          target_host: "{{ inventory_hostname }}"
+          target_env: "{{ mysql_restore_target_env }}"
+          target_db: "{{ mysql_restore_target_db }}"
+          source_env: "{{ mysql_restore_source_env }}"
+          source_db: "{{ mysql_restore_source_db }}"
+          backup_key: "{{ mysql_restore__meta.s3_key }}"
+          backup_created_at: "{{ mysql_restore__meta.created_at }}"
+          backup_sha256: "{{ mysql_restore__meta.sha256 }}"
+          backup_size_bytes: "{{ mysql_restore__meta.size_bytes }}"
+          restored: "{{ mysql_restore__needed | bool }}"
+          masked: "{{ (mysql_restore__needed | bool) and (mysql_restore__profile.masking_template is defined) }}"
+          started_at: "{{ mysql_restore__t_start }}"
+          finished_at: "{{ mysql_restore__t_end }}"
+          duration_seconds: >-
+            {{ ((mysql_restore__t_end | to_datetime('%Y-%m-%dT%H:%M:%SZ'))
+                - (mysql_restore__t_start | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() | int }}
+          import_seconds: "{{ mysql_restore__import_seconds | default(0) }}"
+          data_age_hours: >-
+            {{ (((mysql_restore__t_end | to_datetime('%Y-%m-%dT%H:%M:%SZ'))
+                - (mysql_restore__meta.created_at | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() / 3600) | round(1) }}
+
+    - name: Write the restore marker used by skip_if_unchanged
+      ansible.builtin.copy:
+        content: "{{ mysql_restore__report | to_nice_json }}\n"
+        dest: "{{ mysql_restore_state_dir }}/{{ mysql_restore_target_db }}.json"
+        owner: root
+        group: root
+        mode: "0600"
+      when: mysql_restore__needed | bool
+
+  always:
+    - name: Remove staged backup files and rendered masking SQL
+      ansible.builtin.file:
+        path: "{{ mysql_restore__staged }}"
+        state: absent
+      loop:
+        - "{{ mysql_restore__artifact_path | default('') }}"
+        - "{{ mysql_restore_staging_dir }}/mask.sql"
+      loop_control:
+        loop_var: mysql_restore__staged
+      when:
+        - mysql_restore_cleanup_staging | bool
+        - mysql_restore__staged | length > 0
+
+# Outside the venv block on purpose: this runs on the controller.
+- name: Write the restore report for CI archiving
+  ansible.builtin.copy:
+    content: "{{ mysql_restore__report | to_nice_json }}\n"
+    dest: "{{ mysql_restore_report_to }}/restore-{{ inventory_hostname }}-{{ mysql_restore_target_db }}.json"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when: mysql_restore_report_to | length > 0
+
+- name: Summarise the restore
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Restored' if mysql_restore__report.restored else 'Already up to date:' }}
+      {{ mysql_restore__report.backup_key }} into {{ mysql_restore_target_db }}@{{ inventory_hostname }}
+      in {{ mysql_restore__report.duration_seconds }}s (data age {{ mysql_restore__report.data_age_hours }}h, masked={{ mysql_restore__report.masked }})

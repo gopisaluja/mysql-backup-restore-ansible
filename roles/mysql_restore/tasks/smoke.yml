@@ -1,0 +1,69 @@
+---
+# Read-only checks that the restored (and masked) database is usable.
+- name: Count base tables in the restored database | {{ mysql_restore_target_db }}
+  ansible.mysql.mysql_query:
+    login_db: information_schema
+    query: >-
+      SELECT COUNT(*) AS table_count FROM information_schema.TABLES
+      WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
+    positional_args:
+      - "{{ mysql_restore_target_db }}"
+  register: mysql_restore__tables
+
+- name: Compare the table count with the backup metadata
+  ansible.builtin.assert:
+    that:
+      - (mysql_restore__tables.query_result[0][0].table_count | int) == (mysql_restore__meta.table_count | int)
+    fail_msg: >-
+      Restored {{ mysql_restore__tables.query_result[0][0].table_count }} base tables but the backup recorded
+      {{ mysql_restore__meta.table_count }}.
+    success_msg: "Table count matches the backup ({{ mysql_restore__meta.table_count }})"
+  when:
+    - mysql_restore_check_table_count | bool
+    - mysql_restore__meta.table_count is not none
+
+- name: Count rows in key tables
+  ansible.mysql.mysql_query:
+    login_db: "{{ mysql_restore_target_db }}"
+    query: "SELECT COUNT(*) AS row_count FROM `{{ mysql_restore__min_rows.key }}`"
+  loop: "{{ mysql_restore__profile.min_rows | default({}) | dict2items }}"
+  loop_control:
+    loop_var: mysql_restore__min_rows
+    label: "{{ mysql_restore__min_rows.key }}"
+  register: mysql_restore__row_counts
+
+- name: Assert key tables meet their minimum row counts
+  ansible.builtin.assert:
+    that:
+      - (mysql_restore__row_check.query_result[0][0].row_count | int) >= (mysql_restore__row_check.mysql_restore__min_rows.value | int)
+    fail_msg: >-
+      {{ mysql_restore__row_check.mysql_restore__min_rows.key }} has {{ mysql_restore__row_check.query_result[0][0].row_count }} rows,
+      expected at least {{ mysql_restore__row_check.mysql_restore__min_rows.value }}.
+    quiet: true
+  loop: "{{ mysql_restore__row_counts.results | default([]) }}"
+  loop_control:
+    loop_var: mysql_restore__row_check
+    label: "{{ mysql_restore__row_check.mysql_restore__min_rows.key }}"
+
+- name: Run custom smoke queries
+  ansible.mysql.mysql_query:
+    login_db: "{{ mysql_restore_target_db }}"
+    query: "{{ mysql_restore__query.query }}"
+  loop: "{{ mysql_restore__profile.queries | default([]) }}"
+  loop_control:
+    loop_var: mysql_restore__query
+    label: "{{ mysql_restore__query.name }}"
+  register: mysql_restore__query_results
+
+- name: Assert custom smoke queries return the expected value
+  ansible.builtin.assert:
+    that:
+      - (mysql_restore__query_check.query_result[0][0].result | string) == (mysql_restore__query_check.mysql_restore__query.expected | string)
+    fail_msg: >-
+      Smoke query '{{ mysql_restore__query_check.mysql_restore__query.name }}' returned
+      {{ mysql_restore__query_check.query_result[0][0].result }}, expected {{ mysql_restore__query_check.mysql_restore__query.expected }}.
+    quiet: true
+  loop: "{{ mysql_restore__query_results.results | default([]) }}"
+  loop_control:
+    loop_var: mysql_restore__query_check
+    label: "{{ mysql_restore__query_check.mysql_restore__query.name }}"

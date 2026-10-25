@@ -1,0 +1,120 @@
+---
+# Resolve which backup to use, read its metadata, decide whether a restore is
+# needed and, if so, download the artifact and verify its SHA-256.
+- name: Use the explicitly requested metadata key
+  ansible.builtin.set_fact:
+    mysql_restore__meta_key: "{{ mysql_restore_backup_key }}"
+  when: mysql_restore_backup_key | length > 0
+
+- name: Search S3 for the newest complete backup
+  when: mysql_restore_backup_key | length == 0
+  block:
+    - name: Compute the search prefix
+      ansible.builtin.set_fact:
+        mysql_restore__search_prefix: >-
+          {{ mysql_restore_s3_prefix }}/{{ mysql_restore_source_env }}/{{ mysql_restore_source_db }}/{{
+             '' if mysql_restore_backup_date == 'latest' else (mysql_restore_backup_date | replace('-', '/')) ~ '/' }}
+
+    - name: List backup objects under the prefix
+      amazon.aws.s3_object_info:
+        bucket_name: "{{ mysql_restore_s3_bucket }}"
+        prefix: "{{ mysql_restore__search_prefix }}"
+        region: "{{ mysql_restore_s3_region | default(omit, true) }}"
+      register: mysql_restore__listing
+
+    # Keys embed a sortable UTC timestamp, so lexical order == chronological.
+    # Only *.meta.json counts: it is uploaded last, after the artifact.
+    - name: Pick the newest metadata document
+      ansible.builtin.set_fact:
+        mysql_restore__meta_key: "{{ mysql_restore__listing.s3_keys | select('search', '[.]meta[.]json$') | sort | last | default('') }}"
+
+- name: Fail clearly when no backup matches
+  ansible.builtin.assert:
+    that:
+      - mysql_restore__meta_key | length > 0
+    fail_msg: "No complete backup found under s3://{{ mysql_restore_s3_bucket }}/{{ mysql_restore__search_prefix | default('') }}"
+    quiet: true
+
+- name: Read the backup metadata
+  amazon.aws.s3_object:
+    bucket: "{{ mysql_restore_s3_bucket }}"
+    object: "{{ mysql_restore__meta_key }}"
+    mode: getstr
+    ignore_nonexistent_bucket: true
+    region: "{{ mysql_restore_s3_region | default(omit, true) }}"
+  register: mysql_restore__meta_raw
+  changed_when: false
+
+- name: Parse the backup metadata
+  ansible.builtin.set_fact:
+    mysql_restore__meta: "{{ mysql_restore__meta_raw.contents | from_json }}"
+
+- name: Validate the metadata and backup type
+  ansible.builtin.assert:
+    that:
+      - mysql_restore__meta.method == 'mysqldump'
+      - mysql_restore__meta.name == mysql_restore_source_db
+      - mysql_restore__meta.compression in ['zstd', 'gzip']
+      - mysql_restore__meta.sha256 is match('^[0-9a-f]{64}$')
+      - mysql_restore__meta.s3_key | length > 0
+    fail_msg: >-
+      {{ mysql_restore__meta_key }} is not a usable logical backup of {{ mysql_restore_source_db }}
+      (physical xtrabackup artifacts are restored with the manual prepare/copy-back procedure).
+    quiet: true
+
+- name: Refuse to overwrite the database the backup was taken from
+  ansible.builtin.assert:
+    that:
+      - >-
+        (mysql_restore_allow_same_source | bool) or not
+        (mysql_restore__meta.source_host == inventory_hostname and mysql_restore__meta.name == mysql_restore_target_db)
+    fail_msg: "{{ inventory_hostname }}/{{ mysql_restore_target_db }} is the source of this backup; refusing to overwrite it."
+    quiet: true
+
+- name: Read the marker of the previous restore
+  ansible.builtin.slurp:
+    src: "{{ mysql_restore_state_dir }}/{{ mysql_restore_target_db }}.json"
+  register: mysql_restore__marker
+  failed_when: false
+  when: mysql_restore_skip_if_unchanged | bool
+
+- name: Decide whether the import is needed
+  ansible.builtin.set_fact:
+    mysql_restore__needed: >-
+      {{ not (mysql_restore_skip_if_unchanged | bool)
+         or mysql_restore__marker.content is not defined
+         or (mysql_restore__marker.content | b64decode | from_json).backup_sha256 != mysql_restore__meta.sha256 }}
+
+- name: Download and verify the artifact
+  when: mysql_restore__needed | bool
+  block:
+    - name: Set the local artifact path
+      ansible.builtin.set_fact:
+        mysql_restore__artifact_path: "{{ mysql_restore_staging_dir }}/{{ mysql_restore__meta.s3_key | basename }}"
+
+    - name: Download the artifact
+      amazon.aws.s3_object:
+        bucket: "{{ mysql_restore_s3_bucket }}"
+        object: "{{ mysql_restore__meta.s3_key }}"
+        dest: "{{ mysql_restore__artifact_path }}"
+        mode: get
+        overwrite: different
+        ignore_nonexistent_bucket: true
+        region: "{{ mysql_restore_s3_region | default(omit, true) }}"
+        retries: 3
+
+    - name: Compute the SHA-256 of the download
+      ansible.builtin.stat:
+        path: "{{ mysql_restore__artifact_path }}"
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: mysql_restore__artifact_stat
+
+    - name: Verify the checksum against the backup metadata
+      ansible.builtin.assert:
+        that:
+          - mysql_restore__artifact_stat.stat.checksum == mysql_restore__meta.sha256
+        fail_msg: >-
+          Checksum mismatch for {{ mysql_restore__meta.s3_key }}: expected {{ mysql_restore__meta.sha256 }},
+          got {{ mysql_restore__artifact_stat.stat.checksum }}. Refusing to restore a corrupt or tampered artifact.
+        success_msg: SHA-256 verified

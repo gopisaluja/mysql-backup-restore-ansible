@@ -1,0 +1,51 @@
+---
+# One logical dump of `mysql_backup_db`. Included once per database.
+# The dump is taken WITHOUT --databases, so it carries no CREATE DATABASE/USE
+# statements and can be restored into a schema with a different name.
+- name: Set artifact names | {{ mysql_backup_db }}
+  ansible.builtin.set_fact:
+    mysql_backup__name: "{{ mysql_backup_db }}"
+    mysql_backup__artifact_path: "{{ mysql_backup_staging_dir }}/{{ mysql_backup_db }}_{{ mysql_backup__stamp }}.sql.{{ mysql_backup__ext }}"
+
+- name: Read server version and base-table count | {{ mysql_backup_db }}
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - "--defaults-file={{ mysql_backup_client_cnf }}"
+      - --batch
+      - --skip-column-names
+      - --execute
+      - >-
+        SELECT VERSION(), COUNT(*) FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = '{{ mysql_backup_db }}' AND TABLE_TYPE = 'BASE TABLE'
+  register: mysql_backup__dbinfo
+  changed_when: false
+
+- name: Keep server facts for the metadata document | {{ mysql_backup_db }}
+  ansible.builtin.set_fact:
+    mysql_backup__server_version: "{{ mysql_backup__dbinfo.stdout.split()[0] }}"
+    mysql_backup__table_count: "{{ mysql_backup__dbinfo.stdout.split()[1] | int }}"
+
+- name: Dump and compress in one stream | {{ mysql_backup_db }}
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      mysqldump --defaults-file={{ mysql_backup_client_cnf | quote }}
+      {{ (mysql_backup_mysqldump_opts + mysql_backup_mysqldump_extra_opts) | map('quote') | join(' ') }}
+      {{ mysql_backup_db | quote }}
+      | {{ mysql_backup__compress_cmd }} > {{ mysql_backup__artifact_path | quote }}
+    executable: /bin/bash
+  changed_when: true
+
+- name: Verify the dump decompresses and is complete | {{ mysql_backup_db }}
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      {{ mysql_backup__decompress_cmd }} {{ mysql_backup__artifact_path | quote }}
+      | tail -n 1 | grep -q '^-- Dump completed'
+    executable: /bin/bash
+  changed_when: false
+  when: mysql_backup_verify_dump | bool
+
+- name: Checksum, upload and record metadata | {{ mysql_backup_db }}
+  ansible.builtin.include_tasks: upload.yml

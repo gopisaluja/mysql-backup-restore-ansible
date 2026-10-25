@@ -1,0 +1,150 @@
+---
+# Flow: validate -> prepare host -> dump (per database, or one xtrabackup)
+#       -> verify -> checksum -> upload artifact -> upload metadata -> clean up.
+# Any failure lands in `rescue`, which removes the partial artifact, fires the
+# Slack hook and re-raises so the play (and the Jenkins build) fails.
+- name: Back up MySQL and ship artifacts to S3
+  block:
+    - name: Validate role inputs
+      ansible.builtin.assert:
+        that:
+          - mysql_backup_method in ['mysqldump', 'xtrabackup']
+          - mysql_backup_compression in ['zstd', 'gzip']
+          - mysql_backup_s3_bucket | length > 0
+          - mysql_backup_env | length > 0
+          - mysql_backup_method != 'mysqldump' or mysql_backup_databases | length > 0
+          - mysql_backup_databases | reject('match', '^[A-Za-z0-9_]+$') | list | length == 0
+        fail_msg: >-
+          mysql_backup: set mysql_backup_s3_bucket, mysql_backup_env and (for mysqldump)
+          mysql_backup_databases; database names must match ^[A-Za-z0-9_]+$.
+        quiet: true
+
+    - name: Validate that credentials were supplied (from Ansible Vault)
+      ansible.builtin.assert:
+        that:
+          - mysql_backup_login_user | length > 0
+          - mysql_backup_login_password | length > 0
+        fail_msg: Define vault_mysql_backup_user / vault_mysql_backup_password in an Ansible Vault file.
+        quiet: true
+      when: mysql_backup_manage_client_cnf | bool
+
+    - name: Install compression tools and venv support
+      ansible.builtin.package:
+        name: "{{ mysql_backup_os_packages }}"
+        state: present
+      when: mysql_backup_install_packages | bool
+
+    - name: Install the AWS SDK into a dedicated virtualenv
+      ansible.builtin.pip:
+        name: "{{ mysql_backup_python_packages }}"
+        virtualenv: "{{ mysql_backup_python_venv }}"
+        virtualenv_command: python3 -m venv
+        extra_args: "{{ mysql_backup_pip_extra_args | default(omit, true) }}"
+      when: mysql_backup_install_packages | bool
+
+    - name: Check that the backup tool is installed
+      ansible.builtin.command:
+        argv:
+          - "{{ 'mysqldump' if mysql_backup_method == 'mysqldump' else 'xtrabackup' }}"
+          - --version
+      register: mysql_backup__tool_version
+      changed_when: false
+
+    - name: Create the local staging directory
+      ansible.builtin.file:
+        path: "{{ mysql_backup_staging_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Render the client option file with backup credentials
+      ansible.builtin.template:
+        src: my.cnf.j2
+        dest: "{{ mysql_backup_client_cnf }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: mysql_backup_manage_client_cnf | bool
+
+    - name: Pin one UTC timestamp for every artifact of this run
+      ansible.builtin.set_fact:
+        mysql_backup__created_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Derive naming fragments and compression commands
+      ansible.builtin.set_fact:
+        mysql_backup__stamp: "{{ mysql_backup__created_at | replace('-', '') | replace(':', '') }}"
+        mysql_backup__date_path: "{{ mysql_backup__created_at[0:10] | replace('-', '/') }}"
+        mysql_backup__ext: "{{ 'zst' if mysql_backup_compression == 'zstd' else 'gz' }}"
+        mysql_backup__compress_cmd: >-
+          {{ ('zstd -q -T0 -' ~ mysql_backup_compression_level) if mysql_backup_compression == 'zstd'
+             else ('gzip -' ~ mysql_backup_compression_level) }}
+        mysql_backup__decompress_cmd: "{{ 'zstd -dcq' if mysql_backup_compression == 'zstd' else 'gzip -dc' }}"
+
+    - name: Dump each database with mysqldump
+      ansible.builtin.include_tasks: mysqldump.yml
+      loop: "{{ mysql_backup_databases }}"
+      loop_control:
+        loop_var: mysql_backup_db
+      when: mysql_backup_method == 'mysqldump'
+
+    - name: Take a physical instance backup with xtrabackup
+      ansible.builtin.include_tasks: xtrabackup.yml
+      when: mysql_backup_method == 'xtrabackup'
+
+    - name: Find local artifacts older than the local retention window
+      ansible.builtin.find:
+        paths: "{{ mysql_backup_staging_dir }}"
+        patterns:
+          - "*.sql.zst"
+          - "*.sql.gz"
+          - "*.xbstream.zst"
+          - "*.xbstream.gz"
+          - "*.meta.json"
+        age: "{{ mysql_backup_local_retention_days }}d"
+      register: mysql_backup__old_files
+      when: mysql_backup_keep_local | bool
+
+    - name: Prune old local artifacts (long-term retention is the S3 lifecycle's job)
+      ansible.builtin.file:
+        path: "{{ mysql_backup__old_file.path }}"
+        state: absent
+      loop: "{{ mysql_backup__old_files.files | default([]) }}"
+      loop_control:
+        loop_var: mysql_backup__old_file
+        label: "{{ mysql_backup__old_file.path }}"
+      when: mysql_backup_keep_local | bool
+
+  rescue:
+    - name: Remove the partially written artifact
+      ansible.builtin.file:
+        path: "{{ mysql_backup__artifact_path }}"
+        state: absent
+      when: mysql_backup__artifact_path is defined
+
+    - name: Notify Slack about the failed backup
+      ansible.builtin.uri:
+        url: "{{ mysql_backup_slack_webhook_url }}"
+        method: POST
+        body_format: json
+        body:
+          text: >-
+            :rotating_light: MySQL backup FAILED on {{ inventory_hostname }}
+            (env={{ mysql_backup_env }}, method={{ mysql_backup_method }}).
+            Failed task: {{ ansible_failed_task.name | default('unknown') }}
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+      no_log: true # the webhook URL is a secret
+      failed_when: false # a broken webhook must never hide the real error
+      when:
+        - mysql_backup_notify_on_failure | bool
+        - mysql_backup_slack_webhook_url | length > 0
+
+    - name: Fail with the original error
+      ansible.builtin.fail:
+        msg: >-
+          Backup failed in task '{{ ansible_failed_task.name | default('unknown') }}':
+          {{ ansible_failed_result.msg | default('see the task output above') }}

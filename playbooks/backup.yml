@@ -1,0 +1,12 @@
+---
+# Consistent MySQL backups shipped to S3.
+#
+#   ansible-playbook -i inventories/<env>/hosts.yml playbooks/backup.yml
+#
+# Scheduled daily by jenkins/Jenkinsfile.backup.
+- name: Back up MySQL databases to S3
+  hosts: mysql_backup_sources
+  become: true
+  gather_facts: true
+  roles:
+    - role: mysql_backup

@@ -1,0 +1,118 @@
+---
+# ---------------------------------------------------------------------------
+# What to back up
+# ---------------------------------------------------------------------------
+# mysqldump  : logical, per-database dumps. Restorable by the mysql_restore role.
+# xtrabackup : physical, whole-instance hot backup (Percona XtraBackup must be
+#              installed and the role must run on the database host itself).
+mysql_backup_method: mysqldump
+
+# Databases dumped when mysql_backup_method == mysqldump.
+mysql_backup_databases: []
+
+# Environment label used in the S3 key layout.
+mysql_backup_env: "{{ env_name | default('') }}"
+
+# Name used in the key layout for whole-instance (xtrabackup) artifacts.
+mysql_backup_xtrabackup_name: "{{ inventory_hostname_short }}"
+
+# ---------------------------------------------------------------------------
+# Connection and credentials
+# ---------------------------------------------------------------------------
+# User/password normally come from Ansible Vault. They are only ever written to
+# a 0600 client option file (no_log) and never appear on a command line.
+mysql_backup_login_host: 127.0.0.1
+mysql_backup_login_port: 3306
+mysql_backup_login_user: ""
+mysql_backup_login_password: ""
+
+# A ~/.my.cnf-style option file rendered from the variables above. It is kept
+# separate from root's own ~/.my.cnf and passed with --defaults-file, so an
+# operator's personal config is neither clobbered nor silently merged in.
+# Set mysql_backup_manage_client_cnf: false if another tool provisions it.
+mysql_backup_manage_client_cnf: true
+mysql_backup_client_cnf: /root/.my.backup.cnf
+
+# ---------------------------------------------------------------------------
+# Dump and compression
+# ---------------------------------------------------------------------------
+mysql_backup_compression: zstd # zstd | gzip
+mysql_backup_compression_level: 3
+
+# Always passed to mysqldump:
+#   --single-transaction            consistent InnoDB snapshot without global locks
+#   --quick                         stream rows instead of buffering whole tables
+#   --routines --triggers --events  include stored code, not just data
+#   --hex-blob                      binary-safe dumps
+mysql_backup_mysqldump_opts:
+  - --single-transaction
+  - --quick
+  - --routines
+  - --triggers
+  - --events
+  - --hex-blob
+
+# Site-specific extras.
+#   --set-gtid-purged=OFF  keeps dumps restorable into servers with another GTID
+#                          history (remove it for MariaDB clients, which lack it)
+#   --no-tablespaces       avoids needing the PROCESS privilege on MySQL 8.0.21+
+mysql_backup_mysqldump_extra_opts:
+  - --set-gtid-purged=OFF
+  - --no-tablespaces
+
+mysql_backup_xtrabackup_parallel: 4
+mysql_backup_xtrabackup_extra_opts: []
+
+# Decompress every dump and check for mysqldump's "-- Dump completed" trailer.
+mysql_backup_verify_dump: true
+
+# Reject artifacts smaller than this (catches empty or truncated dumps).
+mysql_backup_min_size_bytes: 1024
+
+# ---------------------------------------------------------------------------
+# Local staging and cleanup
+# ---------------------------------------------------------------------------
+# Needs free space for one compressed artifact per database in this run.
+mysql_backup_staging_dir: /var/backups/mysql
+
+# false: delete local copies once they are safely in S3 (S3 lifecycle owns
+# retention). true: keep them and prune anything older than the window below.
+mysql_backup_keep_local: false
+mysql_backup_local_retention_days: 3
+
+# ---------------------------------------------------------------------------
+# S3 destination
+# Key layout: <prefix>/<env>/<name>/YYYY/MM/DD/<name>_<YYYYMMDDTHHMMSSZ>.<ext>
+#             plus a sibling <name>_<stamp>.meta.json (uploaded last).
+# ---------------------------------------------------------------------------
+mysql_backup_s3_bucket: ""
+mysql_backup_s3_region: "" # empty: SDK default chain
+mysql_backup_s3_prefix: mysql
+# Empty: no encryption headers are sent and the bucket's default SSE-KMS key
+# applies. Set a full key ARN to request that key explicitly.
+mysql_backup_s3_kms_key_id: ""
+mysql_backup_s3_storage_class: STANDARD
+
+# ---------------------------------------------------------------------------
+# Host dependencies
+# ---------------------------------------------------------------------------
+mysql_backup_install_packages: true
+mysql_backup_os_packages: "{{ ['zstd', 'gzip'] + (['python3-venv'] if ansible_facts['os_family'] == 'Debian' else []) }}"
+
+# amazon.aws needs a newer boto3 than most distributions ship, so the S3 tasks
+# run from a dedicated virtualenv instead of the system interpreter.
+mysql_backup_python_venv: /opt/mysql-backup/venv
+mysql_backup_python_packages:
+  - boto3>=1.38.23
+  - botocore>=1.38.23
+mysql_backup_pip_extra_args: "" # e.g. --index-url https://pypi.internal.example/simple
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+# Controller directory to copy metadata JSON into (CI archives it). Empty: off.
+mysql_backup_fetch_metadata_to: ""
+
+# Failure hook: POST to a Slack incoming webhook (from Vault or an env var).
+mysql_backup_notify_on_failure: true
+mysql_backup_slack_webhook_url: ""

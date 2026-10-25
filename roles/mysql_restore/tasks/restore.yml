@@ -1,0 +1,56 @@
+---
+# Destructive part of the role. Only reached after every guard passed and the
+# artifact's checksum matched its metadata.
+- name: Record the import start time
+  ansible.builtin.set_fact:
+    mysql_restore__t_import_start: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Drop the target database for a clean restore | {{ mysql_restore_target_db }}
+  ansible.mysql.mysql_db:
+    name: "{{ mysql_restore_target_db }}"
+    state: absent
+  when: mysql_restore_drop_existing | bool
+
+- name: Create the target database | {{ mysql_restore_target_db }}
+  ansible.mysql.mysql_db:
+    name: "{{ mysql_restore_target_db }}"
+    state: present
+    encoding: "{{ mysql_restore_db_encoding | default(omit, true) }}"
+    collation: "{{ mysql_restore_db_collation | default(omit, true) }}"
+
+- name: Stream the dump into the target database | {{ mysql_restore_target_db }}
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      {{ 'zstd -dcq' if mysql_restore__meta.compression == 'zstd' else 'gzip -dc' }} {{ mysql_restore__artifact_path | quote }}
+      {% if mysql_restore_strip_definers | bool %}| sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g'{% endif %}
+      | mysql --defaults-file={{ mysql_restore_client_cnf | quote }}
+      {{ mysql_restore_mysql_extra_opts | map('quote') | join(' ') }} {{ mysql_restore_target_db | quote }}
+    executable: /bin/bash
+  changed_when: true
+
+- name: Render the PII masking SQL | {{ mysql_restore_source_db }}
+  ansible.builtin.template:
+    src: "{{ mysql_restore__profile.masking_template }}"
+    dest: "{{ mysql_restore_staging_dir }}/mask.sql"
+    owner: root
+    group: root
+    mode: "0600"
+  when: mysql_restore__profile.masking_template | default('') | length > 0
+
+- name: Apply PII masking | {{ mysql_restore_target_db }}
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - "--defaults-file={{ mysql_restore_client_cnf }}"
+      - "{{ mysql_restore_target_db }}"
+      - --execute
+      - "source {{ mysql_restore_staging_dir }}/mask.sql"
+  changed_when: true
+  when: mysql_restore__profile.masking_template | default('') | length > 0
+
+- name: Record how long the import and masking took
+  ansible.builtin.set_fact:
+    mysql_restore__import_seconds: >-
+      {{ ((now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') | to_datetime('%Y-%m-%dT%H:%M:%SZ'))
+          - (mysql_restore__t_import_start | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() | int }}

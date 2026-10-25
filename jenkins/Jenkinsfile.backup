@@ -1,0 +1,100 @@
+// Daily MySQL backups to S3 via the mysql_backup Ansible role.
+//
+// Jenkins credentials (IDs are examples; create them in the folder or globally):
+//   ansible-ssh-key         SSH Username with private key: reaches the DB hosts
+//   ansible-vault-password  Secret file: Ansible Vault password
+//   slack-webhook-db-ops    Secret text: Slack incoming-webhook URL
+//
+// The agent label `ansible` must provide ansible-core (see the CI workflow for
+// the pinned version), python3 and curl. AWS access is NOT handled here: the
+// backup host uses its instance profile / role with the backup-writer policy.
+pipeline {
+  agent { label 'ansible' }
+
+  triggers {
+    // Once a day between 01:00 and 01:59; H spreads jobs across the hour.
+    cron('H 1 * * *')
+  }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '60'))
+    timeout(time: 4, unit: 'HOURS')
+  }
+
+  parameters {
+    string(name: 'INVENTORY', defaultValue: 'inventories/example/hosts.yml', trim: true,
+           description: 'Inventory to run against')
+    string(name: 'LIMIT', defaultValue: 'all', trim: true,
+           description: 'Ansible --limit pattern (e.g. a single host when re-running)')
+  }
+
+  environment {
+    ANSIBLE_FORCE_COLOR = 'false'
+    ANSIBLE_STDOUT_CALLBACK = 'default'
+  }
+
+  stages {
+    stage('Prepare') {
+      steps {
+        sh '''
+          set -eu
+          ansible --version
+          ansible-galaxy collection install -r collections/requirements.yml
+          rm -rf artifacts && mkdir -p artifacts
+        '''
+      }
+    }
+
+    stage('Backup') {
+      steps {
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'ansible-ssh-key', keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER'),
+          file(credentialsId: 'ansible-vault-password', variable: 'VAULT_PASSWORD_FILE'),
+          string(credentialsId: 'slack-webhook-db-ops', variable: 'SLACK_WEBHOOK_URL')
+        ]) {
+          // Single-quoted on purpose: secrets are expanded by the shell, never
+          // interpolated by Groovy, so they cannot leak into the build log.
+          // SLACK_WEBHOOK_URL feeds the role's failure hook (per-host detail).
+          sh '''
+            set -eu
+            export BACKUP_ARTIFACTS_DIR="$WORKSPACE/artifacts"
+            ansible-playbook playbooks/backup.yml \
+              -i "$INVENTORY" \
+              --limit "$LIMIT" \
+              --private-key "$SSH_KEY_FILE" -u "$SSH_USER" \
+              --vault-password-file "$VAULT_PASSWORD_FILE"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      // One <name>_<stamp>.meta.json per database: size, sha256, S3 key, ...
+      archiveArtifacts artifacts: 'artifacts/**/*.meta.json', allowEmptyArchive: true, fingerprint: true
+    }
+    failure {
+      notifySlack(":rotating_light: MySQL backup pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} ${env.BUILD_URL}")
+    }
+    fixed {
+      notifySlack(":white_check_mark: MySQL backups recovered: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
+    }
+  }
+}
+
+// The message travels through an environment variable and is JSON-encoded by
+// python3, so no build data is ever spliced into a shell command line.
+def notifySlack(String text) {
+  withCredentials([string(credentialsId: 'slack-webhook-db-ops', variable: 'SLACK_WEBHOOK_URL')]) {
+    withEnv(["SLACK_TEXT=${text}"]) {
+      sh '''
+        payload=$(python3 -c 'import json, os; print(json.dumps({"text": os.environ["SLACK_TEXT"]}))')
+        curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
+          --data "$payload" "$SLACK_WEBHOOK_URL" || echo "Slack notification failed (ignored)"
+      '''
+    }
+  }
+}

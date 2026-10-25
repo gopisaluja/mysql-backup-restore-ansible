@@ -1,0 +1,67 @@
+---
+# Pure assertions: nothing here touches the host, MySQL or S3. Restores are
+# refused unless every independent check agrees the target is non-production.
+- name: Validate the restore request
+  ansible.builtin.assert:
+    that:
+      - mysql_restore_s3_bucket | length > 0
+      - mysql_restore_source_env | length > 0
+      - mysql_restore_source_db is match('^[A-Za-z0-9_]+$')
+      - mysql_restore_target_db is match('^[A-Za-z0-9_]+$')
+      - mysql_restore_backup_date == 'latest' or mysql_restore_backup_date is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+      - mysql_restore_backup_key | length == 0 or mysql_restore_backup_key is match('^[A-Za-z0-9_./=-]+[.]meta[.]json$')
+    fail_msg: >-
+      Invalid restore request: source/target database names must match ^[A-Za-z0-9_]+$,
+      the backup date must be 'latest' or YYYY-MM-DD, and an explicit key must point at a *.meta.json object.
+    quiet: true
+
+- name: Require an environment label for this host
+  ansible.builtin.assert:
+    that:
+      - mysql_restore_target_env | length > 0
+    fail_msg: "{{ inventory_hostname }} has no env_name in inventory; refusing to guess its environment."
+    quiet: true
+
+- name: Refuse to restore into a protected environment
+  ansible.builtin.assert:
+    that:
+      - (mysql_restore_allow_protected_env | bool) or ((mysql_restore_target_env | lower) not in mysql_restore_protected_envs)
+      - (mysql_restore_allow_protected_env | bool) or ((group_names | intersect(mysql_restore_protected_envs)) | length == 0)
+    fail_msg: >-
+      REFUSING to restore into {{ inventory_hostname }} (env '{{ mysql_restore_target_env }}', groups {{ group_names | join(',') }}):
+      it is a protected environment. Only an approved break-glass run may set mysql_restore_allow_protected_env=true.
+    quiet: true
+
+- name: Check that the requested environment matches the inventory
+  ansible.builtin.assert:
+    that:
+      - mysql_restore_requested_env | length == 0 or mysql_restore_requested_env == mysql_restore_target_env
+    fail_msg: >-
+      Requested environment '{{ mysql_restore_requested_env }}' does not match the inventory environment
+      '{{ mysql_restore_target_env }}' of {{ inventory_hostname }}.
+    quiet: true
+
+- name: Load the policy profile for the source database
+  ansible.builtin.set_fact:
+    mysql_restore__profile: "{{ mysql_restore_db_profiles[mysql_restore_source_db] | default({}) }}"
+
+- name: Enforce the masking policy of this environment
+  ansible.builtin.assert:
+    that:
+      - not (mysql_restore_require_masking | bool) or (mysql_restore__profile.masking_template | default('') | length > 0)
+    fail_msg: >-
+      Masking is required in '{{ mysql_restore_target_env }}' but no masking_template is configured for
+      '{{ mysql_restore_source_db }}' in mysql_restore_db_profiles.
+    quiet: true
+
+- name: Validate smoke-check table names
+  ansible.builtin.assert:
+    that:
+      - (mysql_restore__profile.min_rows | default({})).keys() | reject('match', '^[A-Za-z0-9_]+$') | list | length == 0
+    fail_msg: Table names in min_rows must match ^[A-Za-z0-9_]+$.
+    quiet: true
+
+- name: Warn that the break-glass override is active
+  ansible.builtin.debug:
+    msg: "WARNING: protected-environment override is active for {{ inventory_hostname }} ({{ mysql_restore_target_env }})."
+  when: mysql_restore_allow_protected_env | bool

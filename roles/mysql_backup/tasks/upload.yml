@@ -1,0 +1,124 @@
+---
+# Shared tail for both methods. Expects mysql_backup__name,
+# mysql_backup__artifact_path, mysql_backup__server_version and
+# mysql_backup__table_count to be set by the caller.
+- name: Compute size and SHA-256 of the artifact | {{ mysql_backup__name }}
+  ansible.builtin.stat:
+    path: "{{ mysql_backup__artifact_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: mysql_backup__stat
+
+- name: Reject missing or suspiciously small artifacts | {{ mysql_backup__name }}
+  ansible.builtin.assert:
+    that:
+      - mysql_backup__stat.stat.exists
+      - mysql_backup__stat.stat.size >= (mysql_backup_min_size_bytes | int)
+    fail_msg: "{{ mysql_backup__artifact_path }} is missing or smaller than {{ mysql_backup_min_size_bytes }} bytes."
+    quiet: true
+
+- name: Compute the S3 key prefix | {{ mysql_backup__name }}
+  ansible.builtin.set_fact:
+    mysql_backup__key_dir: "{{ mysql_backup_s3_prefix }}/{{ mysql_backup_env }}/{{ mysql_backup__name }}/{{ mysql_backup__date_path }}"
+    mysql_backup__meta_file: "{{ mysql_backup__name }}_{{ mysql_backup__stamp }}.meta.json"
+
+- name: Compute S3 keys and the local metadata path | {{ mysql_backup__name }}
+  ansible.builtin.set_fact:
+    mysql_backup__s3_key: "{{ mysql_backup__key_dir }}/{{ mysql_backup__artifact_path | basename }}"
+    mysql_backup__meta_key: "{{ mysql_backup__key_dir }}/{{ mysql_backup__meta_file }}"
+    mysql_backup__meta_path: "{{ mysql_backup_staging_dir }}/{{ mysql_backup__meta_file }}"
+
+- name: Build the metadata document | {{ mysql_backup__name }}
+  ansible.builtin.set_fact:
+    mysql_backup__metadata:
+      schema_version: 1
+      name: "{{ mysql_backup__name }}"
+      environment: "{{ mysql_backup_env }}"
+      method: "{{ mysql_backup_method }}"
+      compression: "{{ mysql_backup_compression }}"
+      source_host: "{{ inventory_hostname }}"
+      server_version: "{{ mysql_backup__server_version }}"
+      tool_version: "{{ mysql_backup__tool_version.stdout | trim }}"
+      table_count: "{{ mysql_backup__table_count }}"
+      size_bytes: "{{ mysql_backup__stat.stat.size }}"
+      sha256: "{{ mysql_backup__stat.stat.checksum }}"
+      created_at: "{{ mysql_backup__created_at }}"
+      s3_bucket: "{{ mysql_backup_s3_bucket }}"
+      s3_key: "{{ mysql_backup__s3_key }}"
+
+- name: Write the metadata JSON next to the artifact | {{ mysql_backup__name }}
+  ansible.builtin.copy:
+    content: "{{ mysql_backup__metadata | to_nice_json }}\n"
+    dest: "{{ mysql_backup__meta_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+# Upload order matters: the metadata object is written only after the artifact
+# is stored, so its presence is what marks a backup as complete. The restore
+# role only ever looks for *.meta.json keys.
+- name: Upload to S3 from the role's virtualenv
+  vars:
+    ansible_python_interpreter: "{{ mysql_backup_python_venv }}/bin/python"
+  block:
+    - name: Upload the artifact | {{ mysql_backup__name }}
+      amazon.aws.s3_object:
+        bucket: "{{ mysql_backup_s3_bucket }}"
+        object: "{{ mysql_backup__s3_key }}"
+        src: "{{ mysql_backup__artifact_path }}"
+        mode: put
+        overwrite: never # keys are timestamped; never replace an existing backup
+        # No explicit key: send no SSE headers and let the bucket default
+        # (SSE-KMS) apply. With a key ARN: request aws:kms with that key.
+        encrypt: "{{ mysql_backup_s3_kms_key_id | length > 0 }}"
+        encryption_mode: aws:kms
+        encryption_kms_key_id: "{{ mysql_backup_s3_kms_key_id | default(omit, true) }}"
+        metadata:
+          sha256: "{{ mysql_backup__stat.stat.checksum }}"
+        headers:
+          StorageClass: "{{ mysql_backup_s3_storage_class }}"
+        permission: [] # bucket enforces BucketOwnerEnforced; skip ACL calls
+        ignore_nonexistent_bucket: true # least-privilege IAM: no HeadBucket needed
+        region: "{{ mysql_backup_s3_region | default(omit, true) }}"
+        retries: 3
+
+    - name: Upload the metadata JSON last | {{ mysql_backup__name }}
+      amazon.aws.s3_object:
+        bucket: "{{ mysql_backup_s3_bucket }}"
+        object: "{{ mysql_backup__meta_key }}"
+        src: "{{ mysql_backup__meta_path }}"
+        mode: put
+        overwrite: never
+        encrypt: "{{ mysql_backup_s3_kms_key_id | length > 0 }}"
+        encryption_mode: aws:kms
+        encryption_kms_key_id: "{{ mysql_backup_s3_kms_key_id | default(omit, true) }}"
+        headers:
+          ContentType: application/json
+        permission: []
+        ignore_nonexistent_bucket: true
+        region: "{{ mysql_backup_s3_region | default(omit, true) }}"
+        retries: 3
+
+- name: Copy the metadata to the controller for CI archiving | {{ mysql_backup__name }}
+  ansible.builtin.fetch:
+    src: "{{ mysql_backup__meta_path }}"
+    dest: "{{ mysql_backup_fetch_metadata_to }}/{{ inventory_hostname }}/"
+    flat: true
+  when: mysql_backup_fetch_metadata_to | length > 0
+
+- name: Remove local copies after a successful upload | {{ mysql_backup__name }}
+  ansible.builtin.file:
+    path: "{{ mysql_backup__cleanup_path }}"
+    state: absent
+  loop:
+    - "{{ mysql_backup__artifact_path }}"
+    - "{{ mysql_backup__meta_path }}"
+  loop_control:
+    loop_var: mysql_backup__cleanup_path
+  when: not (mysql_backup_keep_local | bool)
+
+- name: Report the stored backup | {{ mysql_backup__name }}
+  ansible.builtin.debug:
+    msg: >-
+      Stored s3://{{ mysql_backup_s3_bucket }}/{{ mysql_backup__s3_key }}
+      ({{ mysql_backup__stat.stat.size | human_readable }}, sha256 {{ mysql_backup__stat.stat.checksum }})

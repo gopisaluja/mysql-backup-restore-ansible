@@ -1,0 +1,106 @@
+---
+# ---------------------------------------------------------------------------
+# Which backup to restore
+# ---------------------------------------------------------------------------
+mysql_restore_source_env: prod
+mysql_restore_source_db: ""
+
+# "latest", or a UTC date (YYYY-MM-DD) to take the newest backup of that day.
+mysql_restore_backup_date: latest
+
+# Exact S3 key of a *.meta.json document. Overrides mysql_restore_backup_date.
+mysql_restore_backup_key: ""
+
+mysql_restore_s3_bucket: ""
+mysql_restore_s3_region: "" # empty: SDK default chain
+mysql_restore_s3_prefix: mysql
+
+# ---------------------------------------------------------------------------
+# Where to restore, and the guards around it
+# ---------------------------------------------------------------------------
+mysql_restore_target_db: "{{ mysql_restore_source_db }}"
+
+# Environment of THIS host, from inventory. It is never taken from the requester.
+mysql_restore_target_env: "{{ env_name | default('') }}"
+
+# Environment the requester asked for (e.g. the Jenkins TARGET_ENV parameter).
+# When set, it must equal mysql_restore_target_env or the role stops.
+mysql_restore_requested_env: ""
+
+# Hosts whose env_name or inventory groups match these are refused...
+mysql_restore_protected_envs:
+  - prod
+  - production
+# ...unless this break-glass override is set explicitly for one run (the host
+# must also be added to the restore target group in inventory).
+mysql_restore_allow_protected_env: false
+
+# Refuse to overwrite the very database a backup was taken from.
+mysql_restore_allow_same_source: false
+
+# Drop and recreate the target schema so no stale tables survive the restore.
+mysql_restore_drop_existing: true
+mysql_restore_db_encoding: utf8mb4
+mysql_restore_db_collation: ""
+
+# Rewrite DEFINER=`user`@`host` to CURRENT_USER so views, triggers and
+# routines import even when the production definer does not exist here.
+mysql_restore_strip_definers: true
+mysql_restore_mysql_extra_opts: []
+
+# ---------------------------------------------------------------------------
+# Connection and credentials (TCP; values from Ansible Vault)
+# ---------------------------------------------------------------------------
+mysql_restore_login_host: 127.0.0.1
+mysql_restore_login_port: 3306
+mysql_restore_login_user: ""
+mysql_restore_login_password: ""
+mysql_restore_manage_client_cnf: true
+mysql_restore_client_cnf: /root/.my.restore.cnf
+
+# ---------------------------------------------------------------------------
+# Per-database policy: PII masking and smoke checks
+# ---------------------------------------------------------------------------
+# mysql_restore_db_profiles:
+#   app_db:
+#     masking_template: mask_pii.sql.j2   # rendered with ansible.builtin.template
+#     min_rows: {users: 1}                # table -> minimum row count
+#     queries:                            # each returns one column named `result`
+#       - name: No unmasked e-mail addresses remain
+#         query: "SELECT COUNT(*) AS result FROM users WHERE email NOT LIKE '%@example.invalid'"
+#         expected: 0
+mysql_restore_db_profiles: {}
+
+# Fail before touching anything if the database has no masking template.
+mysql_restore_require_masking: false
+
+# Compare the restored base-table count with the count recorded at backup time.
+mysql_restore_check_table_count: true
+
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
+# A marker per target database records which backup (by SHA-256) was restored.
+# true: skip download/import when the requested backup is already in place.
+# false (default): always reset the target to the backup, which is what a
+# developer asking for "fresh data" usually wants.
+mysql_restore_skip_if_unchanged: false
+mysql_restore_state_dir: /var/lib/mysql-restore
+
+# ---------------------------------------------------------------------------
+# Staging and host dependencies
+# ---------------------------------------------------------------------------
+mysql_restore_staging_dir: /var/tmp/mysql-restore
+mysql_restore_cleanup_staging: true
+
+mysql_restore_install_packages: true
+mysql_restore_os_packages: "{{ ['zstd', 'gzip'] + (['python3-venv'] if ansible_facts['os_family'] == 'Debian' else []) }}"
+mysql_restore_python_venv: /opt/mysql-restore/venv
+mysql_restore_python_packages:
+  - boto3>=1.38.23
+  - botocore>=1.38.23
+  - PyMySQL>=1.1
+mysql_restore_pip_extra_args: ""
+
+# Controller directory for the JSON restore report (CI archives it). Empty: off.
+mysql_restore_report_to: ""

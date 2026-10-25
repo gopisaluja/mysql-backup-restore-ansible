@@ -1,0 +1,28 @@
+---
+mysql_restore_source_env: prod
+mysql_restore_s3_bucket: "{{ backup_s3_bucket }}"
+mysql_restore_s3_region: "{{ backup_s3_region }}"
+mysql_restore_s3_prefix: "{{ backup_s3_prefix }}"
+
+mysql_restore_login_user: "{{ vault_mysql_restore_user }}"
+mysql_restore_login_password: "{{ vault_mysql_restore_password }}"
+
+# Masking is environment policy, not a per-request option: every database
+# restored here must have a masking template in its profile.
+mysql_restore_require_masking: true
+
+# Per-source-database policy: masking SQL + post-restore smoke checks.
+mysql_restore_db_profiles:
+  app_db:
+    masking_template: mask_pii.sql.j2 # bundled example; point at your own file
+    min_rows:
+      users: 1
+    queries:
+      - name: No unmasked e-mail addresses remain
+        query: "SELECT COUNT(*) AS result FROM users WHERE email NOT LIKE '%@example.invalid'"
+        expected: 0
+  # billing_db:
+  #   masking_template: "{{ inventory_dir }}/masking/billing_db.sql.j2"
+
+# Jenkins exports RESTORE_ARTIFACTS_DIR so the restore report is archived.
+mysql_restore_report_to: "{{ lookup('ansible.builtin.env', 'RESTORE_ARTIFACTS_DIR') }}"

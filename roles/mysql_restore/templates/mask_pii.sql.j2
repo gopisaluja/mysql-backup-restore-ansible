@@ -1,0 +1,38 @@
+-- {{ ansible_managed }}
+-- Example PII masking for an `app_db`-style schema. Rendered and executed
+-- against `{{ mysql_restore_target_db }}` on {{ inventory_hostname }} ({{ mysql_restore_target_env }})
+-- right after the import and before any smoke check or developer access.
+--
+-- Replace the statements with ones that match your schema. Guidelines:
+--   * keep primary keys so joins and foreign keys keep working;
+--   * make replacements deterministic (derived from the id) so repeated
+--     restores produce identical masked data;
+--   * remove secrets outright (sessions, tokens, API keys) rather than masking.
+
+SET SESSION sql_safe_updates = 0;
+START TRANSACTION;
+
+-- Direct identifiers
+UPDATE users
+SET email         = CONCAT('user', id, '@example.invalid'),
+    first_name    = CONCAT('First', id),
+    last_name     = CONCAT('Last', id),
+    phone         = NULL,
+    date_of_birth = NULL,
+    password_hash = '!disabled';
+
+-- Postal data: keep country/region for business logic, drop the rest
+UPDATE addresses
+SET line1       = CONCAT(id, ' Example Street'),
+    line2       = NULL,
+    postal_code = '00000';
+
+-- Free text frequently leaks PII
+UPDATE support_tickets
+SET body = '[redacted]';
+
+-- Credentials and sessions never leave production
+DELETE FROM user_sessions;
+DELETE FROM api_tokens;
+
+COMMIT;

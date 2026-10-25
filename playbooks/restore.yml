@@ -1,0 +1,47 @@
+---
+# Restore a backup from S3 into a NON-production environment.
+#
+#   ansible-playbook -i inventories/<env>/hosts.yml playbooks/restore.yml \
+#     -e restore_target_env=staging -e restore_source_db=app_db \
+#     [-e restore_backup_date=2026-10-20] [-e restore_target_db=app_db] \
+#     [-e restore_backup_key=mysql/prod/app_db/2026/10/20/app_db_20261020T010412Z.meta.json]
+#
+# Triggered on request (with approval) by jenkins/Jenkinsfile.restore.
+- name: Validate the restore request
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require a target environment and a source database
+      ansible.builtin.assert:
+        that:
+          - restore_target_env is defined
+          - restore_target_env is match('^[a-z0-9_-]+$')
+          - restore_source_db is defined
+        fail_msg: Pass -e restore_target_env=<env> -e restore_source_db=<database>.
+        quiet: true
+
+    # Without this, a request for an environment that has no restore targets
+    # (prod, by design) would match zero hosts and "succeed" silently.
+    - name: Require at least one restore target in the requested environment
+      ansible.builtin.assert:
+        that:
+          - (groups[restore_target_env] | default([])) | intersect(groups['mysql_restore_targets'] | default([])) | length > 0
+        fail_msg: >-
+          No host in '{{ restore_target_env }}' is a member of mysql_restore_targets.
+          Production is never a restore target.
+        quiet: true
+
+- name: Restore a MySQL backup into a non-production environment
+  # The default only keeps --syntax-check happy; play 1 already enforced it.
+  hosts: "{{ restore_target_env | default('no_target_env') }}:&mysql_restore_targets"
+  become: true
+  gather_facts: true
+  vars:
+    mysql_restore_requested_env: "{{ restore_target_env }}"
+    mysql_restore_source_db: "{{ restore_source_db }}"
+    mysql_restore_backup_date: "{{ restore_backup_date | default('latest', true) }}"
+    mysql_restore_backup_key: "{{ restore_backup_key | default('', true) }}"
+    mysql_restore_target_db: "{{ restore_target_db | default(restore_source_db, true) }}"
+  roles:
+    - role: mysql_restore

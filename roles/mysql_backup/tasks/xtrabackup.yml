@@ -1,0 +1,56 @@
+---
+# Physical, whole-instance hot backup streamed as xbstream. Runs on the database
+# host itself (needs datadir access). Restoring it is a manual procedure
+# (prepare + copy-back on a stopped server) and is not automated by mysql_restore.
+- name: Set artifact names for the instance backup
+  ansible.builtin.set_fact:
+    mysql_backup__name: "{{ mysql_backup_xtrabackup_name }}"
+    mysql_backup__artifact_path: >-
+      {{ mysql_backup_staging_dir }}/{{ mysql_backup_xtrabackup_name }}_{{ mysql_backup__stamp }}.xbstream.{{ mysql_backup__ext }}
+    mysql_backup__table_count: null
+
+- name: Read server version
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - "--defaults-file={{ mysql_backup_client_cnf }}"
+      - --batch
+      - --skip-column-names
+      - --execute
+      - SELECT VERSION()
+  register: mysql_backup__dbinfo
+  changed_when: false
+
+- name: Keep the server version for the metadata document
+  ansible.builtin.set_fact:
+    mysql_backup__server_version: "{{ mysql_backup__dbinfo.stdout | trim }}"
+
+- name: Create the xtrabackup scratch directory
+  ansible.builtin.file:
+    path: "{{ mysql_backup_staging_dir }}/xtrabackup-tmp"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stream xtrabackup through compression
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      xtrabackup --defaults-extra-file={{ mysql_backup_client_cnf | quote }}
+      --backup --stream=xbstream
+      --parallel={{ mysql_backup_xtrabackup_parallel | int }}
+      --target-dir={{ (mysql_backup_staging_dir ~ '/xtrabackup-tmp') | quote }}
+      {{ mysql_backup_xtrabackup_extra_opts | map('quote') | join(' ') }}
+      | {{ mysql_backup__compress_cmd }} > {{ mysql_backup__artifact_path | quote }}
+    executable: /bin/bash
+  changed_when: true
+
+- name: Test the integrity of the compressed stream
+  ansible.builtin.command:
+    argv: "{{ (['zstd', '-tq'] if mysql_backup_compression == 'zstd' else ['gzip', '-t']) + [mysql_backup__artifact_path] }}"
+  changed_when: false
+  when: mysql_backup_verify_dump | bool
+
+- name: Checksum, upload and record metadata
+  ansible.builtin.include_tasks: upload.yml

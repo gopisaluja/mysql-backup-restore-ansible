@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+# Client credentials for the mysql_restore role (mode 0600, owner root).
+# Values are quoted; backslashes and double quotes are escaped.
+[client]
+user="{{ mysql_restore_login_user | replace('\\', '\\\\') | replace('"', '\\"') }}"
+password="{{ mysql_restore_login_password | replace('\\', '\\\\') | replace('"', '\\"') }}"
+host={{ mysql_restore_login_host }}
+port={{ mysql_restore_login_port }}

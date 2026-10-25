@@ -1,0 +1,20 @@
+---
+mysql_backup_method: mysqldump # or: xtrabackup (physical, whole instance)
+mysql_backup_databases:
+  - app_db
+  - billing_db
+mysql_backup_env: "{{ env_name }}"
+mysql_backup_compression: zstd
+
+mysql_backup_s3_bucket: "{{ backup_s3_bucket }}"
+mysql_backup_s3_region: "{{ backup_s3_region }}"
+mysql_backup_s3_prefix: "{{ backup_s3_prefix }}"
+mysql_backup_s3_kms_key_id: "{{ backup_s3_kms_key_id }}"
+
+# From Ansible Vault - rendered into a 0600 client option file, never logged.
+mysql_backup_login_user: "{{ vault_mysql_backup_user }}"
+mysql_backup_login_password: "{{ vault_mysql_backup_password }}"
+
+mysql_backup_slack_webhook_url: "{{ ops_slack_webhook_url }}"
+# Jenkins exports BACKUP_ARTIFACTS_DIR so metadata JSON is archived with the build.
+mysql_backup_fetch_metadata_to: "{{ lookup('ansible.builtin.env', 'BACKUP_ARTIFACTS_DIR') }}"

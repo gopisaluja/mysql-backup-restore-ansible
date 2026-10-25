@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  author: Gobinda Saluja
+  description: Consistent MySQL backups (mysqldump or XtraBackup) compressed, checksummed and shipped to S3 with SSE-KMS.
+  license: MIT
+  min_ansible_version: "2.18"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: Debian
+      versions:
+        - bookworm
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+  galaxy_tags:
+    - mysql
+    - backup
+    - s3
+    - database
+dependencies: []
